@@ -38,8 +38,8 @@ From source:
 # Install dependencies
 install.packages(c("rstan", "brms", "ggplot2", "tidyr", "loo"))
 
-# Install from source
-install.packages("path/to/gsf", repos = NULL, type = "source")
+# Or install via remotes from GitHub
+remotes::install_github("ashgreat/gsf")
 ```
 
 ## Quick Start
