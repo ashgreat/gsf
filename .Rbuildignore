@@ -1,0 +1,11 @@
+^.*\.Rproj$
+^\.Rproj\.user$
+^LICENSE\.md$
+^\.github$
+^codecov\.yml$
+^\.lintr$
+^README\.Rmd$
+^cran-comments\.md$
+^CRAN-SUBMISSION$
+^\.r-lib$
+^\.\.Rcheck$

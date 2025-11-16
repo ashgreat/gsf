@@ -1,0 +1,295 @@
+---
+title: "Introduction to gsf: Generalized Stochastic Frontier Model"
+author: "Package Author"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Introduction to gsf}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+## Overview
+
+The `gsf` package implements the Generalized Stochastic Frontier (GSF) model
+from Kumbhakar and Tsionas (2021) "Dissections of input and output efficiency:
+A generalized stochastic frontier model." This model jointly estimates:
+
+1. **Output technical inefficiency** (u₀): The percentage reduction in output due to managerial inefficiency
+2. **Input-specific inefficiencies/slacks** (θⱼ): The percentage over-use of each input
+
+The key innovation is separating these two sources of inefficiency, allowing managers
+to identify which inputs are being used inefficiently.
+
+## Installation
+
+```{r, eval = FALSE}
+# Install from source
+install.packages("gsf", repos = NULL, type = "source")
+
+# Or using devtools
+devtools::install_local("path/to/gsf")
+```
+
+## The Model
+
+The GSF model uses a translog production function:
+
+$$
+y_i = \alpha_0 + \delta_0' \tilde{z}_i + \alpha'(x_i + \theta_i) + \frac{1}{2}(x_i + \theta_i)'B(x_i + \theta_i) + u_{0i} + \varepsilon_{0i}
+$$
+
+Where:
+- $y_i = \ln Y_i$ is log output
+- $x_i = \ln X_i$ is the vector of log inputs
+- $\theta_i \leq 0$ are input-specific slacks (negative = over-use)
+- $u_{0i} \leq 0$ is output technical inefficiency
+- $\varepsilon_{0i} \sim N(0, \sigma^2)$ is random noise
+- $z_i$ are exogenous variables affecting slacks
+
+The input slacks are modeled as:
+$$
+\theta_i = \Delta z_i + u_i, \quad u_i \sim N_J(0, \Omega), \quad \theta_i \leq 0
+$$
+
+## Example: UK Manufacturing Data
+
+This example replicates the analysis from the paper using simulated data that
+mimics the UK manufacturing dataset.
+
+### Step 1: Simulate Data
+
+```{r simulate_data}
+library(gsf)
+
+# Simulate UK manufacturing-like data
+set.seed(42)
+uk_data <- simulate_uk_manufacturing(
+  n_firms = 100,  # Using fewer firms for faster computation
+  avg_periods = 9,
+  seed = 42
+)
+
+# View structure
+head(uk_data)
+str(uk_data)
+
+# Summary statistics
+summary(uk_data[, c("Y", "L", "K", "CR", "MKSH", "FP", "IMP")])
+```
+
+### Step 2: Fit the GSF Model
+
+```{r fit_model, eval = FALSE}
+# Fit the model (this takes time due to MCMC sampling)
+fit <- gsf_fit(
+  formula = log(Y) ~ log(L) + log(K),
+  data = uk_data,
+  z_vars = c("CR", "MKSH", "FP", "IMP", "TREND"),
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  cores = 4,
+  seed = 123
+)
+
+# Basic output
+print(fit)
+```
+
+### Step 3: Examine Results
+
+```{r results, eval = FALSE}
+# Comprehensive summary
+summary(fit)
+
+# Efficiency summary table (Table 2 in paper)
+eff_table <- efficiency_summary(fit)
+print(eff_table)
+
+# Extract technical inefficiency
+ti <- extract_technical_inefficiency(fit)
+head(ti)
+cat("\nMean technical inefficiency:", mean(ti$mean), "%\n")
+
+# Extract input slacks
+slacks <- extract_input_slacks(fit)
+labor_slack <- slacks[slacks$input == "log(L)", ]
+capital_slack <- slacks[slacks$input == "log(K)", ]
+
+cat("Mean labor slack:", mean(labor_slack$mean), "%\n")
+cat("Mean capital slack:", mean(capital_slack$mean), "%\n")
+
+# Extract output loss
+total_loss <- extract_output_loss(fit, component = "total")
+cat("Mean total output loss:", mean(total_loss$mean), "%\n")
+```
+
+### Step 4: Interpret Delta Coefficients
+
+The Delta coefficients show how exogenous variables affect input slacks:
+
+```{r delta, eval = FALSE}
+# Extract Delta coefficients (Table 3 in paper)
+delta_coef <- extract_delta_coefficients(fit)
+print(delta_coef)
+
+# Interpretation:
+# - Positive coefficients: Variable increases slack (less efficient)
+# - Negative coefficients: Variable decreases slack (more efficient)
+```
+
+### Step 5: Visualizations
+
+```{r plots, eval = FALSE}
+# Distribution of efficiency measures (Figure 2 in paper)
+plot(fit, type = "efficiency")
+
+# Input-specific slacks
+plot(fit, type = "slacks")
+
+# Output loss distributions
+plot(fit, type = "output_loss")
+
+# Input elasticities
+plot(fit, type = "elasticities")
+
+# Returns to scale
+plot(fit, type = "rts")
+
+# Effects of z variables on slacks
+plot_marginal_effects(fit)
+
+# Compare best and worst firms (Figure 3 in paper)
+best_worst <- plot_best_worst_firms(fit, n_firms = 5)
+print(best_worst$worst)
+print(best_worst$best)
+```
+
+### Step 6: Model Diagnostics
+
+```{r diagnostics, eval = FALSE}
+# Check MCMC convergence
+plot(fit, type = "trace")
+
+# Model comparison metrics
+waic_result <- waic(fit)
+cat("WAIC:", waic_result$waic, "\n")
+
+# LOO-CV (requires loo package)
+if (requireNamespace("loo", quietly = TRUE)) {
+  loo_result <- loo_cv(fit)
+  print(loo_result)
+}
+```
+
+## Interpreting Results
+
+### Technical Inefficiency
+- Represents output loss due to managerial inefficiency
+- A value of 2.43% means output is 2.43% below the frontier
+
+### Input Slacks
+- Represent over-use of specific inputs
+- Labor slack of 2.35% means labor is used 2.35% more than necessary
+- Capital slack of 10.74% means capital is over-used by 10.74%
+
+### Output Loss from Slacks
+- The combined effect of input slacks on output
+- In the paper: 9.2% average output loss from slacks
+- Total loss = Technical inefficiency + Output loss from slacks
+
+### Delta Coefficients
+From Table 3 in the paper:
+- **CR (Concentration Ratio)**: Positive = less competition leads to more slack
+- **MKSH (Market Share)**: Mixed effects on labor and capital
+- **FP (Financial Pressure)**: Positive = pressure reduces slacks
+- **IMP (Import Penetration)**: Affects capital slack more
+- **TREND**: Time effects on efficiency
+
+## Comparison with Standard SFA
+
+The traditional stochastic frontier model only estimates output technical
+inefficiency, missing the input-specific slacks. The GSF model provides:
+
+1. More detailed efficiency decomposition
+2. Input-specific inefficiency measures
+3. Better understanding of X-efficiency sources
+4. Policy-relevant insights for managers
+
+## Advanced Usage
+
+### Using with Real Data
+
+```{r real_data, eval = FALSE}
+# Load your data
+data <- read.csv("your_data.csv")
+
+# Ensure variables are properly scaled
+data$log_output <- log(data$output)
+data$log_labor <- log(data$labor)
+data$log_capital <- log(data$capital)
+
+# Fit model
+fit <- gsf_fit(
+  formula = log_output ~ log_labor + log_capital,
+  data = data,
+  z_vars = c("competition", "market_share", "financial_pressure"),
+  chains = 4,
+  iter = 4000,  # More iterations for real data
+  warmup = 2000,
+  cores = parallel::detectCores() - 1
+)
+```
+
+### Multiple Inputs
+
+The model supports any number of inputs:
+
+```{r multiple_inputs, eval = FALSE}
+# Three inputs: Labor, Capital, Materials
+fit_3inputs <- gsf_fit(
+  formula = log(Y) ~ log(L) + log(K) + log(M),
+  data = data,
+  z_vars = c("competition"),
+  chains = 4,
+  iter = 2000
+)
+```
+
+### Panel Data Features
+
+For panel data, specify the identifiers:
+
+```{r panel, eval = FALSE}
+fit_panel <- gsf_fit(
+  formula = log(Y) ~ log(L) + log(K),
+  data = panel_data,
+  z_vars = c("competition"),
+  panel_id = "firm_id",
+  time_id = "year",
+  chains = 4,
+  iter = 2000
+)
+```
+
+## References
+
+Kumbhakar, S.C. and Tsionas, M.G. (2021). "Dissections of input and output
+efficiency: A generalized stochastic frontier model." International Journal
+of Production Economics, 232, 107940.
+
+## Session Info
+
+```{r session}
+sessionInfo()
+```
