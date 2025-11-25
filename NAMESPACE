@@ -1,0 +1,6 @@
+import(methods)
+import(Rcpp)
+import(rstan)
+importFrom(rstan, sampling)
+useDynLib(GSF, .registration = TRUE)
+exportPattern("^[[:alpha:]]+")
