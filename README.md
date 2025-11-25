@@ -1,4 +1,4 @@
-# GSF: Generalized Stochastic Frontier Analysis
+# gsf: Generalized Stochastic Frontier Analysis
 
 This R package implements the Generalized Stochastic Frontier (GSF) model with input-specific inefficiencies as described in Kumbhakar and Tsionas (2021). It uses `rstan` for Bayesian estimation.
 
@@ -8,7 +8,7 @@ You can install the package from GitHub using the `remotes` package:
 
 ```R
 # install.packages("remotes")
-remotes::install_github("yourusername/GSF")
+remotes::install_github("ashgreat/gsf")
 ```
 
 ## Usage
@@ -16,7 +16,7 @@ remotes::install_github("yourusername/GSF")
 Here is a simple example using simulated data:
 
 ```R
-library(GSF)
+library(gsf)
 
 # 1. Simulate data
 set.seed(123)

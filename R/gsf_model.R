@@ -21,7 +21,7 @@ gsf <- function(y, X, Z, ...) {
     )
 
     # Find the Stan model file
-    stan_file <- system.file("stan_files", "gsf.stan", package = "GSF")
+    stan_file <- system.file("stan_files", "gsf.stan", package = "gsf")
     if (stan_file == "") {
         # Fallback for development (when not installed)
         stan_file <- "src/stan_files/gsf.stan"

@@ -1,4 +1,4 @@
-Package: GSF
+Package: gsf
 Type: Package
 Title: Generalized Stochastic Frontier Analysis
 Version: 0.1.0
