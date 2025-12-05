@@ -17,8 +17,15 @@ extract_technical_inefficiency <- function(object, type = "mean", interval = 0.9
     stop("object must be of class 'gsf_fit'")
   }
 
-  # Extract samples
-  samples <- rstan::extract(object$stanfit, pars = "technical_inefficiency")[[1]]
+  # Extract samples based on sampler type
+  if (object$sampler == "gibbs") {
+    # Gibbs sampler: u0 is stored as (n_samples x N)
+    # Technical inefficiency = -u0 * 100
+    samples <- -object$gibbs_samples$u0 * 100
+  } else {
+    # Stan sampler
+    samples <- rstan::extract(object$stanfit, pars = "technical_inefficiency")[[1]]
+  }
 
   if (type == "samples") {
     return(samples)
@@ -68,8 +75,15 @@ extract_input_slacks <- function(object, input = NULL, type = "mean", interval =
     stop("object must be of class 'gsf_fit'")
   }
 
-  # Extract samples (iterations x N x J)
-  samples <- rstan::extract(object$stanfit, pars = "input_slacks")[[1]]
+  # Extract samples (iterations x N x J) based on sampler type
+  if (object$sampler == "gibbs") {
+    # Gibbs sampler: theta is stored as (n_samples x N x J)
+    # Input slacks = -theta * 100
+    samples <- -object$gibbs_samples$theta * 100
+  } else {
+    # Stan sampler
+    samples <- rstan::extract(object$stanfit, pars = "input_slacks")[[1]]
+  }
 
   if (type == "samples") {
     if (!is.null(input)) {
@@ -162,14 +176,63 @@ extract_output_loss <- function(object, component = "total", type = "mean") {
     stop("object must be of class 'gsf_fit'")
   }
 
-  if (component == "total") {
-    samples <- rstan::extract(object$stanfit, pars = "total_output_loss")[[1]]
-  } else if (component == "slacks") {
-    samples <- rstan::extract(object$stanfit, pars = "output_loss_from_slacks")[[1]]
-  } else if (component == "technical") {
-    samples <- rstan::extract(object$stanfit, pars = "technical_inefficiency")[[1]]
+  if (object$sampler == "gibbs") {
+    # For Gibbs sampler, compute output loss from stored samples
+    # Technical inefficiency = -u0 * 100
+    tech_ineff <- -object$gibbs_samples$u0 * 100
+
+    if (component == "technical") {
+      samples <- tech_ineff
+    } else {
+      # Compute output loss from slacks
+      # Loss = theta'q + 0.5*theta'B*theta where q = alpha + B*x (observed inputs)
+      n_samples <- length(object$gibbs_samples$sigma)
+      N <- object$model_info$N
+      J <- object$model_info$J
+      X <- object$gibbs_samples$X
+
+      slack_loss <- matrix(0, n_samples, N)
+      for (s in 1:n_samples) {
+        alpha <- object$gibbs_samples$alpha[s, ]
+        # Reconstruct B matrix
+        B_vech <- object$gibbs_samples$B_vech[s, ]
+        B <- matrix(0, J, J)
+        idx <- 1
+        for (i in 1:J) {
+          for (j in i:J) {
+            B[i, j] <- B_vech[idx]
+            B[j, i] <- B_vech[idx]
+            idx <- idx + 1
+          }
+        }
+
+        for (i in 1:N) {
+          theta_i <- object$gibbs_samples$theta[s, i, ]
+          x_i <- X[i, ]
+          q_i <- alpha + B %*% x_i  # Elasticity at observed inputs
+          slack_loss[s, i] <- -(sum(theta_i * q_i) + 0.5 * t(theta_i) %*% B %*% theta_i) * 100
+        }
+      }
+
+      if (component == "slacks") {
+        samples <- slack_loss
+      } else if (component == "total") {
+        samples <- tech_ineff + slack_loss
+      } else {
+        stop("component must be 'total', 'slacks', or 'technical'")
+      }
+    }
   } else {
-    stop("component must be 'total', 'slacks', or 'technical'")
+    # Stan sampler
+    if (component == "total") {
+      samples <- rstan::extract(object$stanfit, pars = "total_output_loss")[[1]]
+    } else if (component == "slacks") {
+      samples <- rstan::extract(object$stanfit, pars = "output_loss_from_slacks")[[1]]
+    } else if (component == "technical") {
+      samples <- rstan::extract(object$stanfit, pars = "technical_inefficiency")[[1]]
+    } else {
+      stop("component must be 'total', 'slacks', or 'technical'")
+    }
   }
 
   if (type == "samples") {
@@ -208,8 +271,39 @@ extract_elasticities <- function(object, type = "mean") {
     stop("object must be of class 'gsf_fit'")
   }
 
-  # Extract samples (iterations x N x J)
-  samples <- rstan::extract(object$stanfit, pars = "elasticities")[[1]]
+  if (object$sampler == "gibbs") {
+    # Compute elasticities from Gibbs samples
+    # Elasticity = alpha + B * x_eff where x_eff = x + theta
+    n_samples <- length(object$gibbs_samples$sigma)
+    N <- object$model_info$N
+    J <- object$model_info$J
+    X <- object$gibbs_samples$X
+
+    samples <- array(0, c(n_samples, N, J))
+    for (s in 1:n_samples) {
+      alpha <- object$gibbs_samples$alpha[s, ]
+      # Reconstruct B matrix
+      B_vech <- object$gibbs_samples$B_vech[s, ]
+      B <- matrix(0, J, J)
+      idx <- 1
+      for (i in 1:J) {
+        for (j in i:J) {
+          B[i, j] <- B_vech[idx]
+          B[j, i] <- B_vech[idx]
+          idx <- idx + 1
+        }
+      }
+
+      for (i in 1:N) {
+        theta_i <- object$gibbs_samples$theta[s, i, ]
+        x_eff <- X[i, ] + theta_i
+        samples[s, i, ] <- alpha + B %*% x_eff
+      }
+    }
+  } else {
+    # Stan sampler
+    samples <- rstan::extract(object$stanfit, pars = "elasticities")[[1]]
+  }
 
   if (type == "samples") {
     return(samples)
@@ -255,7 +349,15 @@ extract_returns_to_scale <- function(object, type = "mean") {
     stop("object must be of class 'gsf_fit'")
   }
 
-  samples <- rstan::extract(object$stanfit, pars = "returns_to_scale")[[1]]
+  if (object$sampler == "gibbs") {
+    # RTS = sum of elasticities = sum(alpha + B * x_eff)
+    elas_samples <- extract_elasticities(object, type = "samples")
+    # Sum across inputs (dimension 3)
+    samples <- apply(elas_samples, c(1, 2), sum)
+  } else {
+    # Stan sampler
+    samples <- rstan::extract(object$stanfit, pars = "returns_to_scale")[[1]]
+  }
 
   if (type == "samples") {
     return(samples)
@@ -362,8 +464,13 @@ extract_delta_coefficients <- function(object) {
     stop("object must be of class 'gsf_fit'")
   }
 
-  # Extract Delta matrix samples
-  samples <- rstan::extract(object$stanfit, pars = "Delta_raw")[[1]]
+  if (object$sampler == "gibbs") {
+    # Gibbs sampler: Delta is stored as (n_samples x J x M)
+    samples <- object$gibbs_samples$Delta
+  } else {
+    # Stan sampler
+    samples <- rstan::extract(object$stanfit, pars = "Delta_raw")[[1]]
+  }
 
   # samples is (iterations x J x M)
   J <- dim(samples)[2]

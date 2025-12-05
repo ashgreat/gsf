@@ -18,23 +18,30 @@
 #'   If NULL, cross-sectional data is assumed.
 #' @param time_id Character string naming the time identifier variable.
 #'   Required if panel_id is specified.
-#' @param chains Number of MCMC chains (default: 4).
-#' @param iter Number of iterations per chain (default: 2000).
-#' @param warmup Number of warmup iterations (default: 1000).
+#' @param sampler Character string specifying the MCMC sampler to use.
+#'   Either "gibbs" (default, using Gibbs sampler from Kumbhakar & Tsionas 2021)
+#'   or "stan" (using Stan's HMC/NUTS).
+#' @param chains Number of MCMC chains (default: 4 for Stan, 1 for Gibbs).
+#' @param iter Number of iterations per chain (default: 2000 for Stan, 10000 for Gibbs).
+#' @param warmup Number of warmup/burn-in iterations (default: 1000 for Stan, 5000 for Gibbs).
 #' @param thin Thinning rate (default: 1).
 #' @param cores Number of cores for parallel computation (default: parallel::detectCores() - 1).
+#'   Only used for Stan sampler.
 #' @param prior_sigma_scale Prior scale for noise standard deviation (default: 1).
 #' @param prior_sigma_u_scale Prior scale for output inefficiency (default: 0.5).
 #' @param prior_delta_scale Prior scale for regression coefficients (default: 10).
 #' @param prior_omega_scale Prior scale for slack covariance (default: 0.1).
 #' @param seed Random seed for reproducibility.
-#' @param ... Additional arguments passed to rstan::sampling.
+#' @param verbose Logical, print progress messages (default: TRUE).
+#' @param ... Additional arguments passed to rstan::sampling (for Stan sampler).
 #'
 #' @return An object of class "gsf_fit" containing:
-#'   \item{stanfit}{The rstan fit object}
+#'   \item{stanfit}{The rstan fit object (if sampler="stan")}
+#'   \item{gibbs_samples}{The Gibbs sampler output (if sampler="gibbs")}
 #'   \item{data}{The processed data}
 #'   \item{model_info}{Information about the model specification}
 #'   \item{call}{The original function call}
+#'   \item{sampler}{The sampler used ("gibbs" or "stan")}
 #'
 #' @examples
 #' \dontrun{
@@ -68,9 +75,10 @@ gsf_fit <- function(formula,
                     neutral_vars = NULL,
                     panel_id = NULL,
                     time_id = NULL,
-                    chains = 4,
-                    iter = 2000,
-                    warmup = 1000,
+                    sampler = c("gibbs", "stan"),
+                    chains = NULL,
+                    iter = NULL,
+                    warmup = NULL,
                     thin = 1,
                     cores = parallel::detectCores() - 1,
                     prior_sigma_scale = 1,
@@ -78,9 +86,25 @@ gsf_fit <- function(formula,
                     prior_delta_scale = 10,
                     prior_omega_scale = 0.1,
                     seed = NULL,
+                    verbose = TRUE,
                     ...) {
 
   call <- match.call()
+
+  # Match sampler argument
+
+  sampler <- match.arg(sampler)
+
+  # Set defaults based on sampler
+  if (sampler == "gibbs") {
+    if (is.null(chains)) chains <- 1
+    if (is.null(iter)) iter <- 10000
+    if (is.null(warmup)) warmup <- 5000
+  } else {
+    if (is.null(chains)) chains <- 4
+    if (is.null(iter)) iter <- 2000
+    if (is.null(warmup)) warmup <- 1000
+  }
 
   # Parse formula
   parsed <- parse_gsf_formula(formula, data)
@@ -142,64 +166,124 @@ gsf_fit <- function(formula,
     )
   }
 
-  # Prepare Stan data
-  stan_data <- list(
-    N = N,
-    J = J,
-    M_slack = M_slack,
-    M_neutral = M_neutral,
-    y = as.vector(y),
-    X = X,
-    Z_slack = Z_slack,
-    Z_neutral = Z_neutral,
-    prior_sigma_scale = prior_sigma_scale,
-    prior_sigma_u_scale = prior_sigma_u_scale,
-    prior_delta_scale = prior_delta_scale,
-    prior_omega_scale = prior_omega_scale
-  )
+  # Fit model based on sampler choice
+  stanfit <- NULL
+  gibbs_samples <- NULL
+  brms_shell <- NULL
 
-  # Get Stan model
-  stan_file <- system.file("stan", "gsf_model.stan", package = "gsf")
-  if (stan_file == "") {
-    # For development, use local path
-    stan_file <- file.path(getwd(), "inst", "stan", "gsf_model.stan")
-    if (!file.exists(stan_file)) {
-      stop("Stan model file not found. Please ensure gsf package is properly installed.")
+  if (sampler == "gibbs") {
+    # ==================================================================
+    # Gibbs Sampler (Kumbhakar & Tsionas 2021)
+    # ==================================================================
+    if (verbose) {
+      message("Fitting GSF model using Gibbs sampler...")
+      message("Iterations: ", iter, " (burn-in: ", warmup, ", thin: ", thin, ")")
     }
+
+    # Check for required packages
+    if (!requireNamespace("mvtnorm", quietly = TRUE)) {
+      stop("Package 'mvtnorm' is required for the Gibbs sampler. Please install it.")
+    }
+
+    # Set up prior
+    n_B_vech <- J * (J + 1) / 2
+    n_delta <- 1 + J + n_B_vech + M_neutral
+
+    prior <- list(
+      delta_mean = rep(0, n_delta),
+      delta_var = diag(prior_delta_scale^2, n_delta),
+      a_sigma = 1,
+      b_sigma = prior_sigma_scale,
+      a_u = 1,
+      b_u = prior_sigma_u_scale,
+      Delta_var = prior_delta_scale^2,
+      nu_Omega = J + 1,
+      S_Omega = diag(prior_omega_scale, J)
+    )
+
+    # Run Gibbs sampler
+    gibbs_samples <- gsf_gibbs_sampler(
+      y = as.vector(y),
+      X = X,
+      Z_slack = Z_slack,
+      Z_neutral = if (M_neutral > 0) Z_neutral else NULL,
+      n_iter = iter,
+      n_burnin = warmup,
+      n_thin = thin,
+      prior = prior,
+      seed = seed,
+      verbose = verbose
+    )
+
+    # Store X in samples for later use
+    gibbs_samples$X <- X
+
+  } else {
+    # ==================================================================
+    # Stan Sampler (HMC/NUTS)
+    # ==================================================================
+
+    # Prepare Stan data
+    stan_data <- list(
+      N = N,
+      J = J,
+      M_slack = M_slack,
+      M_neutral = M_neutral,
+      y = as.vector(y),
+      X = X,
+      Z_slack = Z_slack,
+      Z_neutral = Z_neutral,
+      prior_sigma_scale = prior_sigma_scale,
+      prior_sigma_u_scale = prior_sigma_u_scale,
+      prior_delta_scale = prior_delta_scale,
+      prior_omega_scale = prior_omega_scale
+    )
+
+    # Get Stan model
+    stan_file <- system.file("stan", "gsf_model.stan", package = "gsf")
+    if (stan_file == "") {
+      # For development, use local path
+      stan_file <- file.path(getwd(), "inst", "stan", "gsf_model.stan")
+      if (!file.exists(stan_file)) {
+        stop("Stan model file not found. Please ensure gsf package is properly installed.")
+      }
+    }
+
+    # Compile and fit model
+    if (verbose) message("Compiling Stan model...")
+    stan_model <- rstan::stan_model(stan_file)
+
+    if (verbose) {
+      message("Fitting GSF model with ", chains, " chains, ", iter, " iterations each...")
+      message("This may take a while for large datasets...")
+    }
+
+    if (!is.null(seed)) {
+      set.seed(seed)
+    }
+
+    stanfit <- rstan::sampling(
+      stan_model,
+      data = stan_data,
+      chains = chains,
+      iter = iter,
+      warmup = warmup,
+      thin = thin,
+      cores = cores,
+      seed = seed,
+      control = list(adapt_delta = 0.95, max_treedepth = 12),
+      ...
+    )
+
+    # Build brmsfit shell for downstream interoperability
+    brms_shell <- build_brms_shell(
+      stanfit = stanfit,
+      formula = formula,
+      data = clean_data,
+      stan_file = stan_file,
+      stan_data = stan_data
+    )
   }
-
-  # Compile and fit model
-  message("Compiling Stan model...")
-  stan_model <- rstan::stan_model(stan_file)
-
-  message("Fitting GSF model with ", chains, " chains, ", iter, " iterations each...")
-  message("This may take a while for large datasets...")
-
-  if (!is.null(seed)) {
-    set.seed(seed)
-  }
-
-  stanfit <- rstan::sampling(
-    stan_model,
-    data = stan_data,
-    chains = chains,
-    iter = iter,
-    warmup = warmup,
-    thin = thin,
-    cores = cores,
-    seed = seed,
-    control = list(adapt_delta = 0.95, max_treedepth = 12),
-    ...
-  )
-
-  # Build brmsfit shell for downstream interoperability
-  brms_shell <- build_brms_shell(
-    stanfit = stanfit,
-    formula = formula,
-    data = clean_data,
-    stan_file = stan_file,
-    stan_data = stan_data
-  )
 
   # Store model information
   model_info <- list(
@@ -214,7 +298,12 @@ gsf_fit <- function(formula,
     N = N,
     J = J,
     M_slack = M_slack,
-    panel = panel_info
+    panel = panel_info,
+    sampler = sampler,
+    chains = chains,
+    iter = iter,
+    warmup = warmup,
+    thin = thin
   )
 
   # Store processed data
@@ -229,10 +318,12 @@ gsf_fit <- function(formula,
   # Create output object
   result <- list(
     stanfit = stanfit,
+    gibbs_samples = gibbs_samples,
     brmsfit = brms_shell,
     data = processed_data,
     model_info = model_info,
-    call = call
+    call = call,
+    sampler = sampler
   )
 
   class(result) <- "gsf_fit"
@@ -316,18 +407,38 @@ print.gsf_fit <- function(x, ...) {
     cat("Neutral shifters:", paste(x$model_info$neutral_names, collapse = ", "), "\n")
   }
 
-  cat("\nMCMC Sampling:\n")
-  cat("Chains:", length(x$stanfit@stan_args), "\n")
-  cat("Iterations:", x$stanfit@stan_args[[1]]$iter, "\n")
-  cat("Warmup:", x$stanfit@stan_args[[1]]$warmup, "\n")
+  cat("\nSampler:", x$sampler, "\n")
 
-  # Quick convergence check
-  rhats <- rstan::summary(x$stanfit)$summary[, "Rhat"]
-  rhats <- rhats[!is.na(rhats) & is.finite(rhats)]
-  max_rhat <- max(rhats)
-  cat("\nMax Rhat:", round(max_rhat, 3), "\n")
-  if (max_rhat > 1.1) {
-    cat("WARNING: Some parameters have Rhat > 1.1. Consider more iterations.\n")
+  if (x$sampler == "gibbs") {
+    cat("MCMC Settings:\n")
+    cat("  Iterations:", x$model_info$iter, "\n")
+    cat("  Burn-in:", x$model_info$warmup, "\n")
+    cat("  Thin:", x$model_info$thin, "\n")
+    n_samples <- length(x$gibbs_samples$sigma)
+    cat("  Posterior samples:", n_samples, "\n")
+
+    # Acceptance rates
+    if (!is.null(x$gibbs_samples$accept_rates)) {
+      cat("\nAcceptance rates:\n")
+      cat("  theta (avg):", round(mean(x$gibbs_samples$accept_rates$theta) * 100, 1), "%\n")
+      cat("  Delta:", round(x$gibbs_samples$accept_rates$Delta * 100, 1), "%\n")
+      cat("  Omega:", round(x$gibbs_samples$accept_rates$Omega * 100, 1), "%\n")
+    }
+
+  } else {
+    cat("MCMC Settings:\n")
+    cat("  Chains:", length(x$stanfit@stan_args), "\n")
+    cat("  Iterations:", x$stanfit@stan_args[[1]]$iter, "\n")
+    cat("  Warmup:", x$stanfit@stan_args[[1]]$warmup, "\n")
+
+    # Quick convergence check
+    rhats <- rstan::summary(x$stanfit)$summary[, "Rhat"]
+    rhats <- rhats[!is.na(rhats) & is.finite(rhats)]
+    max_rhat <- max(rhats)
+    cat("\nMax Rhat:", round(max_rhat, 3), "\n")
+    if (max_rhat > 1.1) {
+      cat("WARNING: Some parameters have Rhat > 1.1. Consider more iterations.\n")
+    }
   }
 
   invisible(x)
