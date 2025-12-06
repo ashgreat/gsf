@@ -189,14 +189,20 @@ gsf_fit <- function(formula,
     n_B_vech <- J * (J + 1) / 2
     n_delta <- 1 + J + n_B_vech + M_neutral
 
+    # Use informative priors to help with identification
+    # These defaults work well for typical SFA applications
     prior <- list(
       delta_mean = rep(0, n_delta),
       delta_var = diag(prior_delta_scale^2, n_delta),
-      a_sigma = 1,
-      b_sigma = prior_sigma_scale,
-      a_u = 1,
-      b_u = prior_sigma_u_scale,
-      Delta_var = prior_delta_scale^2,
+      # Prior on sigma^2: IG(a, b) with mode = b/(a+1)
+      # Default centers around sigma ~ 0.05-0.1
+      a_sigma = 3,
+      b_sigma = 0.01,
+      # Prior on sigma_u^2: informative prior for output inefficiency
+      # Default centers around sigma_u ~ 0.02-0.05 (small inefficiency)
+      a_u = 3,
+      b_u = 0.002,
+      Delta_var = prior_delta_scale,  # Note: not squared here
       nu_Omega = J + 1,
       S_Omega = diag(prior_omega_scale, J)
     )

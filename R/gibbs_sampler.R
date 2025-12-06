@@ -199,6 +199,10 @@ gsf_gibbs_sampler <- function(y, X, Z_slack, Z_neutral = NULL,
   M <- ncol(Z_slack)
   M_neutral <- if (is.null(Z_neutral)) 0 else ncol(Z_neutral)
 
+  # Compute centering values for inputs (used to reduce multicollinearity)
+  # We center effective inputs in the design matrix for numerical stability
+  X_center <- colMeans(X)
+
   # Number of translog parameters: intercept + J first-order + J(J+1)/2 second-order
   n_B_vech <- J * (J + 1) / 2
 
@@ -209,13 +213,15 @@ gsf_gibbs_sampler <- function(y, X, Z_slack, Z_neutral = NULL,
       delta_mean = rep(0, 1 + J + n_B_vech + M_neutral),
       delta_var = diag(100, 1 + J + n_B_vech + M_neutral),
       # For sigma^2 (noise variance): IG(a_sigma, b_sigma)
-      a_sigma = 1,
-      b_sigma = 1,
+      # Mode at b/(a+1), mean at b/(a-1) for a>1
+      a_sigma = 3,
+      b_sigma = 0.01,  # Prior centered around sigma ~ 0.05-0.1
       # For sigma_u^2 (output inefficiency): IG(a_u, b_u)
-      a_u = 1,
-      b_u = 1,
+      # Use informative prior to help identification: sigma_u typically small
+      a_u = 3,
+      b_u = 0.002,  # Prior centered around sigma_u ~ 0.02-0.05
       # For Delta (slack coefficients): each row ~ N(0, prior_Delta_var * I)
-      Delta_var = 100,
+      Delta_var = 10,
       # For Omega (slack covariance): Wishart(nu_Omega, S_Omega)
       nu_Omega = J + 1,
       S_Omega = diag(0.1, J)
@@ -237,20 +243,26 @@ gsf_gibbs_sampler <- function(y, X, Z_slack, Z_neutral = NULL,
   Delta <- matrix(0, J, M)
   Delta[, 1] <- -0.05  # Small negative intercept for slacks (mean slack ~5%)
 
-  # Slack covariance - start with small values
-  Omega <- diag(0.03^2, J)  # 3% SD for slacks
+  # Slack covariance - start with moderate values matching expected range
+  Omega <- diag(0.08^2, J)  # 8% SD for slacks (typical range 5-15%)
   # Add small correlation
   if (J == 2) {
-    Omega[1, 2] <- Omega[2, 1] <- 0.5 * 0.03^2
+    Omega[1, 2] <- Omega[2, 1] <- 0.3 * 0.08^2
   }
   L_Omega <- chol(Omega)
 
-  # Latent variables - initialize to prior means
+  # Latent variables - initialize with reasonable prior-based values
+  # Start u0 small since true output inefficiency is typically low
+  u0 <- rep(-0.015, N)  # ~1.5% mean output inefficiency
+
+  # Initialize theta using samples from the prior truncated MVN
+  # This gives reasonable starting values based on Delta and Z
   theta <- matrix(0, N, J)
   for (i in 1:N) {
-    theta[i, ] <- pmin(as.vector(Delta %*% Z_slack[i, ]), -0.01)  # Ensure negative
+    mu_theta <- as.vector(Delta %*% Z_slack[i, ])
+    # Sample from truncated MVN prior
+    theta[i, ] <- rtmvnorm_geweke(mu_theta, Omega, upper = rep(0, J), n_gibbs = 20)
   }
-  u0 <- rep(-0.02, N)  # Output inefficiency (negative), ~2% mean
 
   # Storage for samples
   n_samples <- floor((n_iter - n_burnin) / n_thin)
@@ -340,23 +352,40 @@ gsf_gibbs_sampler <- function(y, X, Z_slack, Z_neutral = NULL,
     # ==================================================================
     # y_i = mu_i + u0_i + epsilon_i
     # where mu_i = alpha0 + alpha'x_eff_i + 0.5*x_eff'B*x_eff + delta0'z_neutral
-    # This is linear in delta if we construct the design matrix appropriately
+    #
+    # To reduce multicollinearity, we center the effective inputs:
+    # Let x_c = x_eff - x_bar, then:
+    # y = alpha0 + alpha'(x_bar + x_c) + 0.5*(x_bar + x_c)'B(x_bar + x_c) + ...
+    #   = [alpha0 + alpha'x_bar + 0.5*x_bar'B*x_bar] + [alpha + B*x_bar]'x_c + 0.5*x_c'B*x_c
+    #
+    # So in centered parameterization:
+    # - alpha0_c = alpha0 + alpha'x_bar + 0.5*x_bar'B*x_bar (transformed intercept)
+    # - alpha_c = alpha + B*x_bar (transformed linear coefficients)
+    # - B remains unchanged
+    #
+    # After sampling, we back-transform to recover original alpha:
+    # alpha = alpha_c - B*x_bar
 
-    # Construct design matrix for delta
+    # Update centering based on current mean of effective inputs
+    X_eff_mean <- colMeans(X_eff)
+
+    # Construct design matrix for delta using CENTERED effective inputs
+    X_eff_c <- sweep(X_eff, 2, X_eff_mean, "-")
+
     W <- matrix(0, N, n_delta)
-    W[, 1] <- 1  # intercept
-    W[, 2:(J + 1)] <- X_eff  # first-order terms
+    W[, 1] <- 1  # intercept (will be transformed)
+    W[, 2:(J + 1)] <- X_eff_c  # centered first-order terms
 
-    # Second-order terms (vech of x_eff %*% t(x_eff))
+    # Second-order terms using CENTERED inputs (vech of x_eff_c %*% t(x_eff_c))
     for (i in 1:N) {
-      x_eff <- X_eff[i, ]
+      x_c <- X_eff_c[i, ]
       idx <- J + 2
       for (j1 in 1:J) {
         for (j2 in j1:J) {
           if (j1 == j2) {
-            W[i, idx] <- 0.5 * x_eff[j1]^2
+            W[i, idx] <- 0.5 * x_c[j1]^2
           } else {
-            W[i, idx] <- x_eff[j1] * x_eff[j2]  # off-diagonal: x1*x2 (not 0.5)
+            W[i, idx] <- x_c[j1] * x_c[j2]  # off-diagonal: x1*x2 (not 0.5)
           }
           idx <- idx + 1
         }
@@ -383,7 +412,31 @@ gsf_gibbs_sampler <- function(y, X, Z_slack, Z_neutral = NULL,
     delta_post_mean <- delta_post_var %*% (delta_prior_prec %*% prior$delta_mean +
                                              (1 / sigma_sq) * crossprod(W, y_adj))
 
-    delta <- as.vector(mvtnorm::rmvnorm(1, delta_post_mean, delta_post_var))
+    delta_centered <- as.vector(mvtnorm::rmvnorm(1, delta_post_mean, delta_post_var))
+
+    # Back-transform from centered to original parameterization:
+    # delta_centered = [alpha0_c, alpha_c, B_vech, delta0]
+    # where alpha_c = alpha + B*x_bar (for centered inputs)
+    # So: alpha = alpha_c - B*x_bar
+    # And: alpha0 = alpha0_c - alpha'x_bar - 0.5*x_bar'B*x_bar
+    #             = alpha0_c - alpha_c'x_bar + x_bar'B*x_bar - 0.5*x_bar'B*x_bar
+    #             = alpha0_c - alpha_c'x_bar + 0.5*x_bar'B*x_bar
+
+    alpha_c <- delta_centered[2:(J + 1)]
+    B_vech_curr <- delta_centered[(J + 2):(J + 1 + n_B_vech)]
+    B_curr <- vech_to_B(B_vech_curr, J)
+
+    # Back-transform alpha
+    alpha_orig <- alpha_c - B_curr %*% X_eff_mean
+
+    # Back-transform alpha0
+    alpha0_c <- delta_centered[1]
+    alpha0_orig <- alpha0_c - sum(alpha_c * X_eff_mean) + 0.5 * t(X_eff_mean) %*% B_curr %*% X_eff_mean
+
+    # Construct delta in original parameterization
+    delta <- delta_centered
+    delta[1] <- alpha0_orig
+    delta[2:(J + 1)] <- alpha_orig
 
     # ==================================================================
     # Step 2: Sample sigma^2 (noise variance)
@@ -452,8 +505,9 @@ gsf_gibbs_sampler <- function(y, X, Z_slack, Z_neutral = NULL,
       # Mean of theta prior
       mu_theta <- as.vector(Delta %*% Z_slack[i, ])
 
-      # Random walk proposal with adaptive scale
-      prop_sd <- sqrt(diag(Omega)) * theta_prop_scale[i] * 0.3
+      # Random walk proposal - use fixed proposal scale to avoid feedback loops
+      # Typical slacks are 5-15%, so proposal SD of ~1-2% is reasonable
+      prop_sd <- 0.015 * theta_prop_scale[i]  # ~1.5% base proposal
       theta_prop <- theta_curr + rnorm(J, 0, prop_sd)
 
       # Reject immediately if any theta > 0 (truncation constraint)
@@ -487,6 +541,18 @@ gsf_gibbs_sampler <- function(y, X, Z_slack, Z_neutral = NULL,
       if (log(runif(1)) < log_alpha) {
         theta[i, ] <- theta_prop
         accept_theta[i] <- accept_theta[i] + 1
+      }
+
+      # Adapt proposal scale for this observation during burn-in
+      if (iter <= n_burnin && iter %% 200 == 0 && n_mh_theta > 0) {
+        local_rate <- accept_theta[i] / n_mh_theta
+        if (local_rate < 0.2) {
+          theta_prop_scale[i] <- theta_prop_scale[i] * 0.8
+        } else if (local_rate > 0.5) {
+          theta_prop_scale[i] <- theta_prop_scale[i] * 1.2
+        }
+        # Bound proposal scale
+        theta_prop_scale[i] <- max(0.3, min(3.0, theta_prop_scale[i]))
       }
     }
 
@@ -532,9 +598,9 @@ gsf_gibbs_sampler <- function(y, X, Z_slack, Z_neutral = NULL,
       ll_Delta_curr <- ll_Delta_curr - 0.5 * (t(resid_curr) %*% Omega_inv %*% resid_curr)
       ll_Delta_prop <- ll_Delta_prop - 0.5 * (t(resid_prop) %*% Omega_inv %*% resid_prop)
 
-      # Truncation correction (compute less frequently for speed)
-      # The normalizing constant P(theta <= 0 | mu, Omega) changes with mu
-      if (iter %% 10 == 0 || iter <= n_burnin) {
+      # Truncation correction: P(theta <= 0 | mu, Omega) is the normalizing constant
+      # Compute every few iterations for efficiency (approximation)
+      if (iter %% 5 == 0) {
         ll_Delta_curr <- ll_Delta_curr - log_mvnorm_cdf(rep(0, J), mu_curr, Omega)
         ll_Delta_prop <- ll_Delta_prop - log_mvnorm_cdf(rep(0, J), mu_prop, Omega)
       }
@@ -618,17 +684,19 @@ gsf_gibbs_sampler <- function(y, X, Z_slack, Z_neutral = NULL,
         ll_Omega_curr <- ll_Omega_curr - 0.5 * log_det_curr - 0.5 * t(resid) %*% Omega_inv_curr %*% resid
         ll_Omega_prop <- ll_Omega_prop - 0.5 * log_det_prop - 0.5 * t(resid) %*% Omega_inv_prop %*% resid
 
-        # Truncation correction (subsample for speed)
-        if (i %% 20 == 1) {
-          ll_Omega_curr <- ll_Omega_curr - log_mvnorm_cdf(rep(0, J), mu_theta, Omega) * min(20, N - i + 1)
-          ll_Omega_prop <- ll_Omega_prop - log_mvnorm_cdf(rep(0, J), mu_theta, Omega_prop) * min(20, N - i + 1)
+        # Truncation correction: compute every few iterations (approximation for speed)
+        if (iter %% 5 == 0) {
+          ll_Omega_curr <- ll_Omega_curr - log_mvnorm_cdf(rep(0, J), mu_theta, Omega)
+          ll_Omega_prop <- ll_Omega_prop - log_mvnorm_cdf(rep(0, J), mu_theta, Omega_prop)
         }
       }
 
-      # Prior: Inverse Wishart (approximately flat on reasonable scale)
-      # Use weak prior favoring small variances
-      lp_Omega_curr <- -sum(log(sigma_omega)) - sum(sigma_omega^2) / (2 * 0.1^2)
-      lp_Omega_prop <- -sum(log(sigma_prop)) - sum(sigma_prop^2) / (2 * 0.1^2)
+      # Prior: weakly informative half-Cauchy-like prior on sigma
+      # log p(sigma) propto -log(1 + sigma^2/scale^2) with scale = 0.2
+      # This allows sigma values from 0.01 to 0.3 with reasonable probability
+      prior_scale <- 0.2
+      lp_Omega_curr <- -sum(log(1 + sigma_omega^2 / prior_scale^2))
+      lp_Omega_prop <- -sum(log(1 + sigma_prop^2 / prior_scale^2))
 
       # Jacobian for log transform
       log_jacobian <- sum(log_sigma_prop) - sum(log_sigma_curr)
